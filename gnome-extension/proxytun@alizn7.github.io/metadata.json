@@ -1,0 +1,8 @@
+{
+  "uuid": "proxytun@alizn7.github.io",
+  "name": "proxytun",
+  "description": "Quick Settings toggle for proxytun: route all system traffic through a SOCKS5/HTTP proxy.",
+  "shell-version": ["46", "47", "48", "49", "50"],
+  "url": "https://github.com/alizn7/proxytun",
+  "version": 1
+}

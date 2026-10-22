@@ -1,0 +1,12 @@
+[Unit]
+Description=proxytun: start the last profile at boot
+Documentation=https://github.com/alizn7/proxytun
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/proxytun boot
+
+[Install]
+WantedBy=multi-user.target

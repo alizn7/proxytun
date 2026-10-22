@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ShellCheck
+        run: shellcheck install.sh uninstall.sh
+
+      - name: Install sing-box (to validate generated configs)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(gh release view --repo SagerNet/sing-box --json tagName -q .tagName)
+          ver=${tag#v}
+          curl -fsSL "https://github.com/SagerNet/sing-box/releases/download/$tag/sing-box-$ver-linux-amd64.tar.gz" | tar -xz
+          sudo install -m 0755 "sing-box-$ver-linux-amd64/sing-box" /usr/local/bin/sing-box
+          sing-box version
+
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -v
+
+      - name: GNOME extension syntax
+        run: |
+          cp gnome-extension/proxytun@alizn7.github.io/extension.js "$RUNNER_TEMP/extension.mjs"
+          node --check "$RUNNER_TEMP/extension.mjs"
+          python3 -m json.tool gnome-extension/proxytun@alizn7.github.io/metadata.json > /dev/null

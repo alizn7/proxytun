@@ -1,0 +1,717 @@
+#!/usr/bin/env python3
+"""proxytun: route all system traffic through a SOCKS5 or HTTP proxy using a sing-box TUN."""
+
+import argparse
+import base64
+import ipaddress
+import json
+import os
+import re
+import secrets
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+
+VERSION = "0.1.0"
+
+ETC_DIR = "/etc/proxytun"
+PROFILES_FILE = os.path.join(ETC_DIR, "profiles.json")
+RUN_DIR = "/run/proxytun"
+STATUS_FILE = os.path.join(RUN_DIR, "status.json")
+SINGBOX_CONF = os.path.join(RUN_DIR, "sing-box.json")
+GROUP = "proxytun"
+
+CHECK_TARGET = ("1.1.1.1", 443)
+CHECK_INTERVAL = 5
+FAIL_LIMIT = 3
+TIMEOUT = 4
+
+NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+TYPES = ("socks", "http")
+DEFAULT_PORT = {"socks": 1080, "http": 8080}
+
+SOCKS_ERRORS = {
+    1: "general failure",
+    2: "not allowed by ruleset",
+    3: "network unreachable",
+    4: "host unreachable",
+    5: "connection refused",
+    6: "TTL expired",
+    7: "command not supported",
+    8: "address type not supported",
+}
+
+STATE_TEXT = {
+    "starting": "starting",
+    "active": "ON - all traffic goes through the proxy",
+    "fallback": "proxy unreachable - traffic goes DIRECT until it is back",
+    "blocked": "proxy unreachable - traffic is BLOCKED (kill switch)",
+    "error": "sing-box keeps exiting - see: proxytun logs",
+}
+
+
+class ProxytunError(Exception):
+    pass
+
+
+def die(msg, code=1):
+    print(f"proxytun: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def unit_name(name):
+    return f"proxytun@{name}.service"
+
+
+def ensure_root():
+    if os.geteuid() != 0:
+        os.execvp("sudo", ["sudo", "--", sys.executable, os.path.realpath(__file__), *sys.argv[1:]])
+
+
+def write_json(path, data, mode):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    os.chmod(tmp, mode)
+    return tmp
+
+
+# ---------- profiles ----------
+
+def default_store():
+    return {"last": None, "autostart": False, "dns": "1.1.1.1", "profiles": {}}
+
+
+def load_store():
+    try:
+        with open(PROFILES_FILE) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return default_store()
+    except PermissionError:
+        ensure_root()
+        raise
+    store = default_store()
+    store.update(data)
+    return store
+
+
+def save_store(store):
+    tmp = write_json(PROFILES_FILE, store, 0o640)
+    try:
+        shutil.chown(tmp, group=GROUP)
+    except (LookupError, PermissionError):
+        pass
+    os.replace(tmp, PROFILES_FILE)
+
+
+def parse_target(target):
+    host, sep, port = target.rpartition(":")
+    if not sep:
+        host, port = target, None
+    try:
+        ipaddress.IPv4Address(host)
+    except ValueError:
+        raise ProxytunError(f"'{target}' is neither a saved profile nor an IPv4 address")
+    if port is not None:
+        if not port.isdigit() or not 0 < int(port) < 65536:
+            raise ProxytunError(f"invalid port '{port}'")
+        port = int(port)
+    return host, port
+
+
+def make_profile(target, args, existing=None):
+    prof = dict(existing or {})
+    ptype = getattr(args, "type", None) or prof.get("type") or "socks"
+    if target:
+        host, port = parse_target(target)
+        prof["host"] = host
+        if port is None and prof.get("type") == ptype:
+            port = prof.get("port")
+        prof["port"] = port or DEFAULT_PORT[ptype]
+    elif ptype != prof.get("type") and "port" not in prof:
+        prof["port"] = DEFAULT_PORT[ptype]
+    prof["type"] = ptype
+    if getattr(args, "user", None) is not None:
+        prof["username"] = args.user or None
+    if getattr(args, "password", None) is not None:
+        prof["password"] = args.password or None
+    if getattr(args, "kill_switch", None) is not None:
+        prof["kill_switch"] = args.kill_switch
+    prof.setdefault("username", None)
+    prof.setdefault("password", None)
+    prof.setdefault("kill_switch", False)
+    if "host" not in prof:
+        raise ProxytunError("missing proxy address (HOST[:PORT])")
+    return prof
+
+
+def select_profile(store, target, args):
+    profiles = store["profiles"]
+    if target is None:
+        name = getattr(args, "name", None) or store.get("last")
+        if not name or name not in profiles:
+            raise ProxytunError("no saved profile yet; run: proxytun on HOST[:PORT]")
+        profiles[name] = make_profile(None, args, profiles[name])
+        return name
+    if target in profiles:
+        profiles[target] = make_profile(None, args, profiles[target])
+        return target
+    name = getattr(args, "name", None) or "default"
+    if not NAME_RE.match(name):
+        raise ProxytunError(f"invalid profile name '{name}' (use letters, digits, - and _)")
+    profiles[name] = make_profile(target, args, profiles.get(name))
+    return name
+
+
+def describe(prof):
+    auth = f"{prof['username']}@" if prof.get("username") else ""
+    return f"{prof['type']}://{auth}{prof['host']}:{prof['port']}"
+
+
+# ---------- proxy probes ----------
+
+def recv_exact(sock, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ProxytunError("proxy closed the connection")
+        buf += chunk
+    return buf
+
+
+def socks_auth(sock, prof):
+    user = prof.get("username")
+    sock.sendall(b"\x05\x02\x00\x02" if user else b"\x05\x01\x00")
+    ver, method = recv_exact(sock, 2)
+    if ver != 5:
+        raise ProxytunError("not a SOCKS5 proxy")
+    if method == 2 and user:
+        u, p = user.encode(), (prof.get("password") or "").encode()
+        sock.sendall(b"\x01" + bytes([len(u)]) + u + bytes([len(p)]) + p)
+        if recv_exact(sock, 2)[1] != 0:
+            raise ProxytunError("SOCKS5 authentication failed")
+    elif method == 2 or (method == 0xFF and not user):
+        raise ProxytunError("proxy requires a username/password (-u/-p)")
+    elif method == 0xFF:
+        raise ProxytunError("proxy rejected the login method")
+    elif method != 0:
+        raise ProxytunError(f"unsupported SOCKS5 auth method {method}")
+
+
+def socks_request(sock, cmd, ip, port):
+    sock.sendall(b"\x05" + bytes([cmd]) + b"\x00\x01" + socket.inet_aton(ip) + port.to_bytes(2, "big"))
+    _, rep, _, atyp = recv_exact(sock, 4)
+    if rep != 0:
+        return rep, None, None
+    if atyp == 1:
+        addr = socket.inet_ntoa(recv_exact(sock, 4))
+    elif atyp == 4:
+        addr = socket.inet_ntop(socket.AF_INET6, recv_exact(sock, 16))
+    elif atyp == 3:
+        addr = recv_exact(sock, recv_exact(sock, 1)[0]).decode()
+    else:
+        raise ProxytunError("malformed SOCKS5 reply")
+    return 0, addr, int.from_bytes(recv_exact(sock, 2), "big")
+
+
+def http_connect(sock, prof, host, port):
+    lines = [f"CONNECT {host}:{port} HTTP/1.1", f"Host: {host}:{port}"]
+    if prof.get("username"):
+        cred = base64.b64encode(f"{prof['username']}:{prof.get('password') or ''}".encode()).decode()
+        lines.append(f"Proxy-Authorization: Basic {cred}")
+    sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
+    resp = b""
+    while b"\r\n\r\n" not in resp and len(resp) < 8192:
+        chunk = sock.recv(1024)
+        if not chunk:
+            break
+        resp += chunk
+    status = resp.split(b"\r\n", 1)[0].decode(errors="replace")
+    parts = status.split()
+    if len(parts) < 2 or not parts[0].startswith("HTTP/"):
+        raise ProxytunError("not an HTTP proxy")
+    if parts[1] == "407":
+        raise ProxytunError("proxy requires authentication")
+    if parts[1] != "200":
+        raise ProxytunError(f"proxy answered '{status}'")
+
+
+def check_proxy(prof, target=CHECK_TARGET, timeout=TIMEOUT):
+    """Return None if the proxy can open a TCP connection to target, otherwise an error message."""
+    try:
+        with socket.create_connection((prof["host"], prof["port"]), timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            if prof["type"] == "http":
+                http_connect(sock, prof, *target)
+            else:
+                socks_auth(sock, prof)
+                rep, _, _ = socks_request(sock, 1, *target)
+                if rep != 0:
+                    raise ProxytunError(f"CONNECT failed: {SOCKS_ERRORS.get(rep, rep)}")
+    except ProxytunError as e:
+        return str(e)
+    except OSError as e:
+        return f"cannot reach {prof['host']}:{prof['port']} ({e.strerror or e})"
+    return None
+
+
+def dns_query(name="example.com"):
+    qname = b"".join(bytes([len(p)]) + p.encode() for p in name.split(".")) + b"\x00"
+    return secrets.token_bytes(2) + b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" + qname + b"\x00\x01\x00\x01"
+
+
+def probe_udp(prof, timeout=TIMEOUT):
+    """True only if the proxy actually relays a UDP DNS query (SOCKS5 UDP ASSOCIATE)."""
+    if prof["type"] != "socks":
+        return False
+    try:
+        with socket.create_connection((prof["host"], prof["port"]), timeout=timeout) as ctl:
+            ctl.settimeout(timeout)
+            socks_auth(ctl, prof)
+            rep, addr, port = socks_request(ctl, 3, "0.0.0.0", 0)
+            if rep != 0:
+                return False
+            if addr in ("0.0.0.0", "::"):
+                addr = prof["host"]
+            query = dns_query()
+            packet = b"\x00\x00\x00\x01" + socket.inet_aton("1.1.1.1") + (53).to_bytes(2, "big") + query
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
+                udp.settimeout(timeout)
+                udp.sendto(packet, (addr, port))
+                data, _ = udp.recvfrom(4096)
+            return len(data) >= 22 and data[3] == 1 and data[10:12] == query[:2]
+    except (OSError, ProxytunError, ValueError):
+        return False
+
+
+# ---------- sing-box ----------
+
+def singbox_config(prof, udp, dns="1.1.1.1"):
+    outbound = {"type": prof["type"], "tag": "proxy", "server": prof["host"], "server_port": prof["port"]}
+    if prof["type"] == "socks":
+        outbound["version"] = "5"
+    if prof.get("username"):
+        outbound["username"] = prof["username"]
+        outbound["password"] = prof.get("password") or ""
+    rules = [
+        {"action": "sniff"},
+        {"protocol": "dns", "action": "hijack-dns"},
+        {"ip_is_private": True, "outbound": "direct"},
+    ]
+    if not udp:
+        rules.append({"network": "udp", "action": "reject"})
+    return {
+        "log": {"level": "warn", "timestamp": False},
+        "dns": {
+            "servers": [{"type": "tcp", "tag": "remote", "server": dns, "detour": "proxy"}],
+            "final": "remote",
+            "strategy": "ipv4_only",
+        },
+        "inbounds": [{
+            "type": "tun",
+            "tag": "tun-in",
+            "interface_name": "proxytun0",
+            "address": ["172.19.0.1/30"],
+            "auto_route": True,
+            "strict_route": True,
+            "route_exclude_address": [f"{prof['host']}/32"],
+        }],
+        "outbounds": [outbound, {"type": "direct", "tag": "direct"}],
+        "route": {"rules": rules, "final": "proxy", "auto_detect_interface": True},
+    }
+
+
+def find_singbox():
+    path = shutil.which("sing-box")
+    if not path:
+        raise ProxytunError("sing-box is not installed (run install.sh)")
+    return path
+
+
+# ---------- daemon ----------
+
+class Daemon:
+    def __init__(self, name):
+        store = load_store()
+        if name not in store["profiles"]:
+            raise ProxytunError(f"no such profile '{name}'")
+        self.name = name
+        self.prof = store["profiles"][name]
+        self.dns = store.get("dns") or "1.1.1.1"
+        self.singbox = find_singbox()
+        self.child = None
+        self.udp = None
+        self.fails = 0
+        self.quick_exits = 0
+        self.started_at = 0.0
+        self.state = "starting"
+        self.message = None
+        self.since = time.time()
+        self.stopping = threading.Event()
+        if store.get("last") != name:
+            store["last"] = name
+            save_store(store)
+
+    def write_status(self):
+        status = {
+            "profile": self.name,
+            "state": self.state,
+            "message": self.message,
+            "type": self.prof["type"],
+            "host": self.prof["host"],
+            "port": self.prof["port"],
+            "udp": self.udp,
+            "kill_switch": bool(self.prof.get("kill_switch")),
+            "since": self.since,
+        }
+        os.replace(write_json(STATUS_FILE, status, 0o644), STATUS_FILE)
+
+    def set_state(self, state, message=None):
+        if state == self.state and message == self.message:
+            return
+        if state != self.state:
+            self.since = time.time()
+            log(f"state: {state}" + (f" ({message})" if message else ""))
+        self.state, self.message = state, message
+        self.write_status()
+
+    def running(self):
+        return self.child is not None and self.child.poll() is None
+
+    def reap(self):
+        if self.child is not None and self.child.poll() is not None:
+            rc = self.child.returncode
+            log(f"sing-box exited with code {rc}")
+            self.quick_exits = self.quick_exits + 1 if time.time() - self.started_at < 10 else 1
+            self.child = None
+            if self.quick_exits >= 3:
+                self.set_state("error", f"sing-box exited with code {rc}")
+
+    def start_singbox(self):
+        self.udp = probe_udp(self.prof)
+        cfg = singbox_config(self.prof, self.udp, self.dns)
+        os.replace(write_json(SINGBOX_CONF, cfg, 0o600), SINGBOX_CONF)
+        log(f"starting sing-box for {describe(self.prof)}; "
+            + ("UDP relayed by the proxy" if self.udp else "proxy has no UDP relay, UDP is rejected"))
+        self.started_at = time.time()
+        self.child = subprocess.Popen([self.singbox, "run", "-c", SINGBOX_CONF])
+
+    def stop_singbox(self):
+        if self.running():
+            self.child.terminate()
+            try:
+                self.child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.child.kill()
+                self.child.wait()
+        self.child = None
+
+    def tick(self):
+        self.reap()
+        error = check_proxy(self.prof)
+        if error is None:
+            if self.fails >= FAIL_LIMIT:
+                log("proxy is reachable again")
+            self.fails = 0
+            if not self.running():
+                self.start_singbox()
+            if self.state != "error" or self.running():
+                self.set_state("active")
+            return
+        self.fails += 1
+        if self.fails == 1:
+            log(f"health check failed: {error}")
+        if self.fails < FAIL_LIMIT:
+            return
+        if self.prof.get("kill_switch"):
+            if not self.running():
+                self.start_singbox()
+            self.set_state("blocked", error)
+        else:
+            self.stop_singbox()
+            self.set_state("fallback", error)
+
+    def run(self):
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            signal.signal(sig, lambda *_: self.stopping.set())
+        log(f"proxytun {VERSION}: profile '{self.name}' -> {describe(self.prof)}")
+        self.write_status()
+        while not self.stopping.is_set():
+            self.tick()
+            self.stopping.wait(CHECK_INTERVAL)
+        self.stop_singbox()
+        log("stopped")
+
+
+# ---------- systemd helpers ----------
+
+def systemctl(*args):
+    subprocess.run(["systemctl", *args], check=True)
+
+
+def active_instances():
+    out = subprocess.run(
+        ["systemctl", "list-units", "--plain", "--no-legend", "--all",
+         "--state=active,activating,reloading,deactivating", "proxytun@*.service"],
+        capture_output=True, text=True,
+    ).stdout
+    return [line.split()[0] for line in out.splitlines() if line.strip()]
+
+
+def read_status():
+    try:
+        with open(STATUS_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def exit_ip():
+    try:
+        with urllib.request.urlopen("https://ifconfig.me/ip", timeout=6) as r:
+            return r.read().decode().strip()
+    except Exception:
+        return "unknown (no response)"
+
+
+def print_status(st, show_ip=True):
+    since = time.strftime("%H:%M:%S", time.localtime(st.get("since", time.time())))
+    print(f"state     {STATE_TEXT.get(st['state'], st['state'])}  (since {since})")
+    if st.get("message") and st["state"] != "active":
+        print(f"reason    {st['message']}")
+    print(f"profile   {st['profile']}  {st['type']}://{st['host']}:{st['port']}")
+    if st.get("udp") is not None:
+        print("udp       " + ("relayed by the proxy" if st["udp"] else "rejected (proxy has no UDP relay)"))
+    print(f"kill sw.  {'on' if st.get('kill_switch') else 'off'}")
+    if show_ip and st["state"] in ("active", "fallback"):
+        print(f"exit IP   {exit_ip()}")
+
+
+def wait_for(name, seconds=15):
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        st = read_status()
+        if st and st.get("profile") == name and st.get("state") != "starting":
+            return st
+        time.sleep(0.5)
+    return read_status()
+
+
+# ---------- commands ----------
+
+def cmd_on(args):
+    ensure_root()
+    store = load_store()
+    name = select_profile(store, args.target, args)
+    prof = store["profiles"][name]
+    if not args.force:
+        error = check_proxy(prof)
+        if error:
+            raise ProxytunError(f"{error}\n  nothing was changed (use --force to turn on anyway)")
+    store["last"] = name
+    store["autostart"] = True
+    save_store(store)
+    for unit in active_instances():
+        if unit != unit_name(name):
+            systemctl("stop", unit)
+    systemctl("restart", unit_name(name))
+    st = wait_for(name)
+    if st:
+        print_status(st)
+    else:
+        print("still starting; check: proxytun status / proxytun logs")
+
+
+def cmd_off(args):
+    ensure_root()
+    for unit in active_instances():
+        systemctl("stop", unit)
+    store = load_store()
+    if store.get("autostart") and os.path.exists(PROFILES_FILE):
+        store["autostart"] = False
+        save_store(store)
+    print("proxytun: OFF")
+
+
+def cmd_status(args):
+    st = read_status()
+    if not st:
+        print("proxytun: OFF")
+        return
+    print_status(st, show_ip=not args.no_ip)
+
+
+def cmd_list(args):
+    store = load_store()
+    st = read_status()
+    running = st.get("profile") if st else None
+    if not store["profiles"]:
+        print("no profiles yet; run: proxytun on HOST[:PORT]")
+        return
+    for name in sorted(store["profiles"]):
+        prof = store["profiles"][name]
+        mark = "●" if name == running else " "
+        tags = []
+        if prof.get("kill_switch"):
+            tags.append("kill-switch")
+        if name == store.get("last"):
+            tags.append("last")
+        print(f"{mark} {name:<14} {describe(prof):<32} {' '.join(f'[{t}]' for t in tags)}".rstrip())
+    print(f"\nstart at boot: {'yes' if store.get('autostart') else 'no'}")
+
+
+def cmd_add(args):
+    ensure_root()
+    if not NAME_RE.match(args.name):
+        raise ProxytunError(f"invalid profile name '{args.name}' (use letters, digits, - and _)")
+    store = load_store()
+    store["profiles"][args.name] = make_profile(args.target, args, store["profiles"].get(args.name))
+    save_store(store)
+    print(f"saved '{args.name}': {describe(store['profiles'][args.name])}")
+
+
+def cmd_rm(args):
+    ensure_root()
+    store = load_store()
+    if args.name not in store["profiles"]:
+        raise ProxytunError(f"no such profile '{args.name}'")
+    if unit_name(args.name) in active_instances():
+        systemctl("stop", unit_name(args.name))
+    del store["profiles"][args.name]
+    if store.get("last") == args.name:
+        store["last"] = None
+        store["autostart"] = False
+    save_store(store)
+    print(f"removed '{args.name}'")
+
+
+def cmd_test(args):
+    store = load_store() if args.target is None or NAME_RE.match(args.target) else default_store()
+    if args.target is None or args.target in store["profiles"]:
+        name = args.target or store.get("last")
+        if not name or name not in store["profiles"]:
+            raise ProxytunError("nothing to test; give HOST[:PORT] or a profile name")
+        prof = make_profile(None, args, store["profiles"][name])
+    else:
+        prof = make_profile(args.target, args)
+    print(f"testing {describe(prof)}")
+    error = check_proxy(prof)
+    print(f"  TCP via proxy to {CHECK_TARGET[0]}:{CHECK_TARGET[1]}  " + ("ok" if error is None else f"FAILED: {error}"))
+    if error is None:
+        udp = probe_udp(prof)
+        print("  UDP relay                    " + ("supported" if udp else "not supported (UDP will be rejected)"))
+    sys.exit(0 if error is None else 1)
+
+
+def cmd_logs(args):
+    cmd = ["journalctl", "-u", "proxytun@*", "-n", str(args.lines), "--no-pager"]
+    if args.follow:
+        cmd.append("-f")
+    os.execvp(cmd[0], cmd)
+
+
+def cmd_boot(args):
+    store = load_store()
+    name = store.get("last")
+    if store.get("autostart") and name in store["profiles"]:
+        subprocess.run(["systemctl", "start", "--no-block", unit_name(name)], check=False)
+
+
+def cmd_daemon(args):
+    if os.geteuid() != 0:
+        raise ProxytunError("the daemon must run as root (it is started by systemd)")
+    Daemon(args.name).run()
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="proxytun",
+        description="Route all system traffic through a SOCKS5 or HTTP proxy.",
+    )
+    parser.add_argument("-V", "--version", action="version", version=f"proxytun {VERSION}")
+    sub = parser.add_subparsers(dest="command", metavar="COMMAND")
+    sub.required = True
+
+    def proxy_options(p, kill_switch=True):
+        p.add_argument("-t", "--type", choices=TYPES, help="proxy type (default: socks)")
+        p.add_argument("-u", "--user", help="proxy username")
+        p.add_argument("-p", "--password", help="proxy password")
+        if kill_switch:
+            p.add_argument("--kill-switch", action=argparse.BooleanOptionalAction, default=None,
+                           help="block traffic instead of going direct while the proxy is down")
+
+    p = sub.add_parser("on", help="turn on: HOST[:PORT], a profile name, or nothing for the last profile")
+    p.add_argument("target", nargs="?")
+    p.add_argument("-n", "--name", help="profile to save a HOST[:PORT] under (default: 'default')")
+    p.add_argument("-f", "--force", action="store_true", help="skip the reachability check")
+    proxy_options(p)
+    p.set_defaults(func=cmd_on)
+
+    p = sub.add_parser("off", help="turn off and stop starting at boot")
+    p.set_defaults(func=cmd_off)
+
+    p = sub.add_parser("status", help="show the current state and exit IP")
+    p.add_argument("--no-ip", action="store_true", help="skip the exit IP lookup")
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("list", help="list saved profiles")
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("add", help="save a profile without turning it on")
+    p.add_argument("name")
+    p.add_argument("target", metavar="HOST[:PORT]")
+    proxy_options(p)
+    p.set_defaults(func=cmd_add)
+
+    p = sub.add_parser("rm", help="delete a profile")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_rm)
+
+    p = sub.add_parser("test", help="check a proxy (TCP and UDP support) without changing anything")
+    p.add_argument("target", nargs="?", help="HOST[:PORT] or profile name (default: last profile)")
+    proxy_options(p, kill_switch=False)
+    p.set_defaults(func=cmd_test)
+
+    p = sub.add_parser("logs", help="show service logs")
+    p.add_argument("-f", "--follow", action="store_true")
+    p.add_argument("-n", "--lines", type=int, default=50)
+    p.set_defaults(func=cmd_logs)
+
+    p = sub.add_parser("boot", help="internal: used by proxytun-boot.service")
+    p.set_defaults(func=cmd_boot)
+
+    p = sub.add_parser("daemon", help="internal: used by proxytun@.service")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_daemon)
+
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
+    try:
+        args.func(args)
+    except ProxytunError as e:
+        die(str(e))
+    except subprocess.CalledProcessError as e:
+        die(f"command failed: {' '.join(e.cmd)}")
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()

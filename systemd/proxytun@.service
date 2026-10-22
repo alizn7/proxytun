@@ -1,0 +1,15 @@
+[Unit]
+Description=proxytun system-wide proxy (%i)
+Documentation=https://github.com/alizn7/proxytun
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/proxytun daemon %i
+Restart=on-failure
+RestartSec=3
+KillMode=mixed
+TimeoutStopSec=10
+RuntimeDirectory=proxytun
+RuntimeDirectoryMode=0755
